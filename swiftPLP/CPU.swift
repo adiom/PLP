@@ -1,12 +1,19 @@
 import Foundation
 
 class CPU: ObservableObject {
-    // Регистр x0 ... x7, x0 всегда равен 0
+    // Регистр x0..x7 (x0 всегда равен 0)
     @Published var x: [Int32] = Array(repeating: 0, count: 8)
     @Published var PC: UInt32 = 0
     @Published var memory: [UInt8] = Array(repeating: 0, count: 256)
 
-    // Опкоды инструкций
+    // Консольный вывод для отображения результата системных вызовов вывода
+    @Published var consoleOutput: String = ""
+    // Буфер консольного ввода - символы, которые пользователь "вводит" вручную в UI
+    @Published var consoleInput: [Character] = []
+
+    // Простейшая файловая система
+    var fileSystem = FileSystem()
+
     enum Opcode: UInt8 {
         case ADD  = 0x01
         case SUB  = 0x02
@@ -17,8 +24,24 @@ class CPU: ObservableObject {
         case LUI  = 0x07
         case JAL  = 0x08
         case JALR = 0x09
+        case ECALL = 0x0E
         case HALT = 0xFF
     }
+
+    // Примерный набор системных вызовов. Номер вызова = верхние 16 бит x1:
+    // sysNumber = x1 >> 16
+    //
+    // Предложенные системные вызовы:
+    // 1: print char (вывести символ из x2)
+    // 2: print int (вывести число из x2)
+    // 3: halt (остановить программу)
+    // 4: read char (прочитать символ из consoleInput и положить его в x2)
+    //
+    // Файловые операции (псевдо-файловая система):
+    // 5: open file (x2=addr, x3=len: имя файла в памяти, результат fd в x2)
+    // 6: read file (x2=fd, x3=length, x4=addr) - чтение в память
+    // 7: write file (x2=fd, x3=length, x4=addr) - запись из памяти в файл
+    // 8: close file (x2=fd)
 
     func reset() {
         for i in 1..<x.count {
@@ -26,6 +49,9 @@ class CPU: ObservableObject {
         }
         PC = 0
         memory = Array(repeating: 0, count: 256)
+        consoleOutput = ""
+        consoleInput = []
+        fileSystem = FileSystem()
     }
 
     func loadProgram(assembledCode: [UInt8]) {
@@ -44,30 +70,20 @@ class CPU: ObservableObject {
         let b1 = memory[pc+1]
         let b2 = memory[pc+2]
         let b3 = memory[pc+3]
-        let instruction = UInt32(b0) | (UInt32(b1) << 8) | (UInt32(b2) << 16) | (UInt32(b3) << 24)
-        return instruction
+        return UInt32(b0) | (UInt32(b1) << 8) | (UInt32(b2) << 16) | (UInt32(b3) << 24)
     }
 
     func step() {
         guard let instr = fetchInstruction() else { return }
 
-        // Декодируем
         let opcode = UInt8(instr & 0xFF)
         let r1 = UInt8((instr >> 8) & 0xFF)
         let r2 = UInt8((instr >> 16) & 0xFF)
         let r3 = UInt8((instr >> 24) & 0xFF)
 
-        // В зависимости от инструкции, интерпретируем поля:
-        // Для простоты:
-        // R-type: opcode, rd=r1, rs1=r2, rs2=r3
-        // I-type: opcode, rd=r1, rs1=r2, imm=r3 (знаковый байт)
-        // B-type: opcode, rs1=r1, rs2=r2, imm=r3 (знаковый байт)
-        // U-type: opcode, rd=r1, imm16 = (r3 << 8 | r2)
-        // J-type: opcode, rd=r1, imm16 = (r3 << 8 | r2)
-
         let op = Opcode(rawValue: opcode)
-        PC += 4 // по умолчанию увеличиваем на 4
-        x[0] = 0 // x0 всегда 0
+        PC += 4
+        x[0] = 0
 
         switch op {
         case .ADD:
@@ -93,19 +109,6 @@ class CPU: ObservableObject {
                 x[rd] = Int32(bitPattern: val)
             }
         case .SW:
-            let rs1 = Int(r2)
-            let rs2 = Int(r1) // по формату: rd=r1, rs1=r2, imm=r3 не подходит для SW, переставим местами для удобства
-            // Допустим формат SW: opcode=SW, rs1=base, rs2=reg, imm=offset
-            // Перекодируем в Assembler соответствующим образом
-            // Для согласованности меняем формат SW на: opcode, rs1, rs2, imm
-            // Тогда:
-            // r1=rd, r2=rs1, r3=imm - это было для I-type
-            // нам надо для SW: opcode, rs1, rs2, imm => пусть будет:
-            // Ассемблер будет генерировать: SW x2,0(x1)
-            // -> opcode=0x04, rs1=1 (base), rs2=2 (reg), imm=0
-            // Значит используем поля так: r1=rs1, r2=rs2, r3=imm
-            // Извиняюсь за путаницу, сделаем так:
-            // Переделаем: пусть для SW: opcode=0x04, r1=base, r2=rs, r3=imm
             let base = Int(r1)
             let reg = Int(r2)
             let imm = Int8(bitPattern: r3)
@@ -122,7 +125,6 @@ class CPU: ObservableObject {
             let rs2 = Int(r2)
             let imm = Int8(bitPattern: r3)
             if x[rs1] == x[rs2] {
-                // PC смещаем на imm*4
                 PC = UInt32(Int(PC) + Int(imm)*4)
             }
         case .BNE:
@@ -137,14 +139,13 @@ class CPU: ObservableObject {
             let immLo = r2
             let immHi = r3
             let imm16 = UInt16(immLo) | (UInt16(immHi) << 8)
-            // Запишем imm16 << 16 в регистр
             x[rd] = Int32(Int(imm16) << 16)
         case .JAL:
             let rd = Int(r1)
             let immLo = r2
             let immHi = r3
             let imm16 = Int16(bitPattern: (UInt16(immLo) | (UInt16(immHi) << 8)))
-            x[rd] = Int32(PC) // сохраняем адрес возврата
+            x[rd] = Int32(PC)
             PC = UInt32(Int(PC) + Int(imm16)*4)
         case .JALR:
             let rd = Int(r1)
@@ -152,23 +153,100 @@ class CPU: ObservableObject {
             let imm = Int8(bitPattern: r3)
             x[rd] = Int32(PC)
             PC = UInt32(Int(x[rs1]) + Int(imm))
+        case .ECALL:
+            // Номер системного вызова - старшие 16 бит x1
+            let syscallNumber = Int(x[1]) >> 16
+            handleSyscall(syscallNumber)
         case .HALT:
             print("Program halted.")
-            // Можно остановить выполнение, для теста просто не делаем ничего
-            // или можно обнулить PC
-            break
         default:
             print("Unknown instruction: \(opcode)")
         }
 
-        x[0] = 0 // поддерживаем инвариант
+        x[0] = 0
+    }
+
+    func handleSyscall(_ sysNumber: Int) {
+        switch sysNumber {
+        case 1:
+            // print char: выводим символ из x[2]
+            let charCode = UInt8(truncatingIfNeeded: x[2])
+            if let scalar = UnicodeScalar(UInt32(charCode)) {
+                consoleOutput.append(Character(scalar))
+            }
+        case 2:
+            // print int: выводим число x[2]
+            consoleOutput.append("\(x[2])")
+        case 3:
+            // halt
+            PC = UInt32(memory.count)
+        case 4:
+            // read char: читаем символ из consoleInput
+            if consoleInput.isEmpty {
+                x[2] = -1
+            } else {
+                let ch = consoleInput.removeFirst()
+                x[2] = Int32(ch.asciiValue ?? 0)
+            }
+        case 5:
+            // open file
+            // x2=addr, x3=len, читаем имя файла из памяти
+            let addr = Int(x[2])
+            let length = Int(x[3])
+            if addr >= 0 && addr+length <= memory.count {
+                let nameBytes = memory[addr..<(addr+length)]
+                if let name = String(bytes: nameBytes, encoding: .utf8) {
+                    let fd = fileSystem.openFile(name: name)
+                    x[2] = Int32(fd)
+                } else {
+                    x[2] = -1
+                }
+            } else {
+                x[2] = -1
+            }
+        case 6:
+            // read file
+            // x2=fd, x3=length, x4=addr
+            let fd = Int(x[2])
+            let length = Int(x[3])
+            let addr = Int(x[4])
+            let data = fileSystem.readFile(fd: fd, length: length)
+            let readCount = data.count
+            if addr >= 0 && addr+readCount <= memory.count {
+                for i in 0..<readCount {
+                    memory[addr+i] = data[i]
+                }
+                x[2] = Int32(readCount)
+            } else {
+                x[2] = -1
+            }
+        case 7:
+            // write file
+            // x2=fd, x3=length, x4=addr
+            let fd = Int(x[2])
+            let length = Int(x[3])
+            let addr = Int(x[4])
+            if addr >= 0 && addr+length <= memory.count {
+                let data = Array(memory[addr..<(addr+length)])
+                let written = fileSystem.writeFile(fd: fd, data: data)
+                x[2] = Int32(written)
+            } else {
+                x[2] = -1
+            }
+        case 8:
+            // close file
+            let fd = Int(x[2])
+            let result = fileSystem.closeFile(fd: fd)
+            x[2] = Int32(result ? 0 : -1)
+        default:
+            consoleOutput.append("Unknown syscall: \(sysNumber)\n")
+        }
     }
 
     func run() {
         while PC < UInt32(memory.count) {
-            let instr = fetchInstruction()
-            if instr == nil { break }
-            let opcode = UInt8(instr! & 0xFF)
+            guard let instr = fetchInstruction() else { break }
+            let opcode = UInt8(instr & 0xFF)
             if opcode == Opcode.HALT.rawValue {
                 step()
                 break
